@@ -33,7 +33,30 @@ All exported review rows use the same columns:
 | `clean_reviews.csv` / `clean_reviews.json` | Combined dataset for streaming or further analysis |
 | `amazon_clean.csv` / `spam_clean.csv` | Per-source cleaned splits |
 
-Large raw dumps under `data/*.jsonl.gz` are **gitignored** (GitHub file-size limits). Obtain `Electronics.jsonl.gz` (and optional `meta_Electronics.jsonl.gz`) separately and place them in `data/` before running the notebook end-to-end.
+Large raw Amazon dumps under `data/*.jsonl.gz` (and similar) are **gitignored** (GitHub file-size limits). Download them locally as described below.
+
+## Amazon Reviews 2023 — Electronics (Hugging Face)
+
+Official dataset: **[McAuley-Lab/Amazon-Reviews-2023](https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023)**.
+
+### What to download
+
+| Kind | Path on the Hub | Use in this project |
+|------|-----------------|---------------------|
+| **Electronics reviews** | `raw/review_categories/Electronics.jsonl` | One JSON object per line. The notebook defaults to **`data/Electronics.jsonl.gz`**: either gzip this file to that name or set `AMAZON_PATH` in `data_cleaning.ipynb` to your `.jsonl` path. |
+| **Electronics metadata** | `raw_meta_Electronics/full-00000-of-00010.parquet` … `full-00009-of-00010.parquet` | Ten Parquet shards. **Not** read by `data_cleaning.ipynb` today; keep under `data/` (e.g. `data/raw_meta_Electronics/`) for product-side joins, EDA, or later steps. |
+
+You can grab files from the repository **Files and versions** browser, or use the Hugging Face CLI:
+
+```bash
+pip install -U "huggingface_hub[cli]"
+huggingface-cli download McAuley-Lab/Amazon-Reviews-2023 --repo-type dataset \
+  --include "raw/review_categories/Electronics.jsonl" \
+  --include "raw_meta_Electronics/*.parquet" \
+  --local-dir data/amazon_reviews_2023_hf
+```
+
+After that, point the notebook at the review file (copy or symlink into `data/` as `Electronics.jsonl.gz` / `Electronics.jsonl`, or update `AMAZON_PATH`). Optionally copy `data/amazon_reviews_2023_hf/raw_meta_Electronics/` into `data/raw_meta_Electronics/` so paths stay consistent for the team.
 
 ## Setup
 
@@ -67,9 +90,9 @@ python producer.py \
 
 Use `--max-rows N` to send only the first *N* valid rows for smoke tests. Rows missing required fields (`review_id`, `user_id`, `product_id`, `review_text`, `timestamp`) are skipped.
 
-## Optional: Hugging Face sample
+## Optional: Hugging Face `datasets` sample
 
-The notebook includes a **commented** cell to pull a small slice of `McAuley-Lab/Amazon-Reviews-2023` via `datasets` into a local JSONL file. Uncomment after `pip install datasets` if you want that path instead of a local gzip.
+The notebook includes a **commented** cell to pull a small slice of `McAuley-Lab/Amazon-Reviews-2023` via the `datasets` library into a local JSONL file. Use that for quick experiments; for full Electronics reviews + metadata, prefer the **CLI / Files tab download** section above.
 
 ## Clone URL note
 
