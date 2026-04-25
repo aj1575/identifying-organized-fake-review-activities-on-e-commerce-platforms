@@ -6,6 +6,7 @@ from pyspark.sql.functions import (
     window,
     count,
     approx_count_distinct,
+    collect_set,
     when,
     udf
 )
@@ -125,11 +126,16 @@ USER_BURST_THRESHOLD = 2
 # =========================================================
 # 4. CREATE SPARK SESSION
 # =========================================================
-spark = SparkSession.builder \
-    .appName("KafkaSparkUserTableDGIMBloom") \
-    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1") \
+spark = (
+    SparkSession.builder
+    .appName("Fake Review Project")
+    .master("local[1]")
+    .config("spark.driver.host", "127.0.0.1")
+    .config("spark.driver.bindAddress", "127.0.0.1")
+    .config("spark.sql.shuffle.partitions", "1")
+    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
     .getOrCreate()
-
+)
 spark.sparkContext.setLogLevel("WARN")
 
 
@@ -201,7 +207,8 @@ user_windowed_stats_df = low_rating_df.groupBy(
     col("anonymous_user_id")
 ).agg(
     count("*").alias("low_rating_reviews_by_user_5m"),
-    approx_count_distinct("product_id").alias("distinct_products")
+    approx_count_distinct("product_id").alias("distinct_products"),
+    collect_set("product_id").alias("product_ids")
 )
 
 final_df = user_windowed_stats_df.select(
@@ -210,7 +217,8 @@ final_df = user_windowed_stats_df.select(
     col("user_id"),
     col("anonymous_user_id"),
     col("low_rating_reviews_by_user_5m"),
-    col("distinct_products")
+    col("distinct_products"),
+    col("product_ids")
 )
 
 final_df = final_df.withColumn(

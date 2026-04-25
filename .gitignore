@@ -1,3 +1,11 @@
+*.csv
+spark_features_output/
+spark_checkpoint_features/
+spark_error.txt
+__pycache__/
+.venv/
+
+
 # Raw dumps exceed GitHub's 100MB/file limit — host separately or use Git LFS if you must version them.
 data/*.jsonl.gz
 
