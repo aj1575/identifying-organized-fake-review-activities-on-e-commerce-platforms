@@ -66,16 +66,26 @@ export PATH="$HADOOP_HOME/bin:$PATH"
 
 ### 6. Start Kafka
 
-Open new terminal:
+Open Command Prompt and go to Kafka folder:
 
 ```bash
-zookeeper-server-start.sh config/zookeeper.properties
+cd C:\kafka
+```
+Start Zookeeper:
+
+```bash
+bin\windows\zookeeper-server-start.bat config\zookeeper.properties
 ```
 
-Open another terminal:
+Open another Command Prompt window:
 
 ```bash
-kafka-server-start.sh config/server.properties
+cd C:\kafka
+```
+Start Kafka server:
+
+```bash
+bin\windows\kafka-server-start.bat config\server.properties
 ```
 
 ### 7. Start Neo4j
@@ -87,9 +97,9 @@ Connection details:
 ```text
 bolt://localhost:7687
 username: neo4j
-password: your_password
+password: password123
 ```
-
+Update the Neo4j credentials in the code to match your local database settings.
 
 ## ⚙️ Architecture
 
@@ -147,19 +157,25 @@ Used for:
 
 ## 🚀 How to Run
 
-### 1. Start Spark Consumer
+### 1. Start Neo4j
+Start your local Neo4j database.
+
+### 2. Start Kafka and Zookeeper
+Run Zookeeper and Kafka from Command Prompt.
+
+### 3. Start Spark Consumer
 
 ```bash
 python spark_consumer_neo4j.py
 ```
 
-### 2. Run Kafka Producer
+### 4. Run Kafka Producer
 
 ```bash
-python producer.py --input amazon_clean.csv --start-row 1 --end-row 7000 --sleep 0.01
+python producer.py --input amazon_clean.csv --start-row 1 --end-row 15000 --sleep 0.005 --inject-rate 0.12
 ```
 
-### 3. Extract Features
+### 5. Extract Features
 
 ```bash
 python save_spark_features.py
@@ -167,13 +183,22 @@ python extract_neo4j_features.py
 python merge_features.py
 ```
 
+### 6. Run Anomaly Detection
+
+```bash
+python ml_model.py
+```
+
 ## 📊 Final ML Dataset
 ``` final_features_for_ml.csv```
 
 #### Dataset Info
-* Rows: ~57,000
-* Columns: 17
-* No missing values
+Contains merged Spark and Neo4j features at the user-window level.
+The exact number of rows may vary depending on:
+- producer input range
+- injection rate
+- streaming batches processed
+- deduplication results
 
 ## 📥 Dataset Access
 
@@ -181,21 +206,33 @@ python merge_features.py
 
 [https://drive.google.com/drive/folders/1628IopZ61wqICqIT5bQdb-ADEryiBnoY]
 
-## 🤖 ML Features
-#### Spark Features (Behavioral)
-* low_rating_reviews_by_user_5m
-* distinct_products
-* num_products_in_window
-* burst_detected
-* suspicious_user_flag
-#### Neo4j Features (Graph)
-* num_windows
-* num_suspicious_windows
-* num_total_targeted_products
-* num_suspicious_products_targeted
-* has_multiple_suspicious_windows
-* num_other_users_shared_products
-* max_common_products_with_any_user
+## 🤖 Features Used
 
-## 🎯 Target Variable
-``` suspicious_user_flag```
+Spark Behavioral Features
+- low_rating_reviews_by_user_5m
+- distinct_products
+- num_products_in_window
+- burst_detected
+- suspicious_user_flag
+- source_spam_label
+
+Neo4j Graph Features
+- num_windows
+- num_suspicious_windows
+- num_total_targeted_products
+- num_suspicious_products_targeted
+- max_products_in_one_window
+- avg_products_per_window
+- has_multiple_suspicious_windows
+- num_other_users_shared_products
+- max_common_products_with_any_user
+
+## 🤖 ML / Anomaly Detection
+The final feature dataset is used for anomaly detection using Isolation Forest.
+
+Validation label:
+* source_spam_label
+
+This label is used only to evaluate how well the anomaly detection model identifies suspicious behavior.
+
+The project uses real Amazon review data as the base dataset and injects controlled synthetic suspicious behavior to simulate organized fake review campaigns.
