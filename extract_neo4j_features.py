@@ -15,7 +15,6 @@ def run_query(query: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# 1. Only users that actually appear in the Spark window graph
 q1 = """
 MATCH (u:User)-[:ACTIVE_IN_WINDOW]->(w:ReviewWindow)
 RETURN
@@ -24,7 +23,6 @@ RETURN
     count(DISTINCT CASE WHEN w.suspicious_user_flag = 1 THEN w END) AS num_suspicious_windows
 """
 
-# 2. Total targeted products per active user
 q2 = """
 MATCH (u:User)-[:ACTIVE_IN_WINDOW]->(w:ReviewWindow)-[:TARGETED_PRODUCT]->(p:Product)
 RETURN
@@ -32,7 +30,6 @@ RETURN
     count(DISTINCT p) AS num_total_targeted_products
 """
 
-# 3. Suspicious targeted products only
 q3 = """
 MATCH (u:User)-[:ACTIVE_IN_WINDOW]->(w:ReviewWindow)-[:TARGETED_PRODUCT]->(p:Product)
 WHERE w.suspicious_user_flag = 1
@@ -41,7 +38,6 @@ RETURN
     count(DISTINCT p) AS num_suspicious_products_targeted
 """
 
-# 4. Max / avg products per window
 q4 = """
 MATCH (u:User)-[:ACTIVE_IN_WINDOW]->(w:ReviewWindow)
 OPTIONAL MATCH (w)-[:TARGETED_PRODUCT]->(p:Product)
@@ -52,7 +48,6 @@ RETURN
     avg(products_in_window) AS avg_products_per_window
 """
 
-# 5. Repeated suspicious behavior
 q5 = """
 MATCH (u:User)-[:ACTIVE_IN_WINDOW]->(w:ReviewWindow)
 WITH u.user_id AS user_id,
@@ -62,7 +57,6 @@ RETURN
     CASE WHEN suspicious_windows > 1 THEN 1 ELSE 0 END AS has_multiple_suspicious_windows
 """
 
-# 6. Shared-product overlap with other active users
 q6 = """
 MATCH (u1:User)-[:ACTIVE_IN_WINDOW]->(:ReviewWindow)-[:TARGETED_PRODUCT]->(p:Product)
 MATCH (u2:User)-[:ACTIVE_IN_WINDOW]->(:ReviewWindow)-[:TARGETED_PRODUCT]->(p:Product)
@@ -72,7 +66,6 @@ RETURN
     count(DISTINCT u2.user_id) AS num_other_users_shared_products
 """
 
-# 7. Pair overlap counts
 q7 = """
 MATCH (u1:User)-[:ACTIVE_IN_WINDOW]->(:ReviewWindow)-[:TARGETED_PRODUCT]->(p:Product)
 MATCH (u2:User)-[:ACTIVE_IN_WINDOW]->(:ReviewWindow)-[:TARGETED_PRODUCT]->(p:Product)
@@ -89,7 +82,6 @@ df5 = run_query(q5)
 df6 = run_query(q6)
 pair_df = run_query(q7)
 
-# derive max_common_products_with_any_user
 if not pair_df.empty:
     left_df = pair_df.groupby("user1", as_index=False)["common_products"].max()
     left_df.columns = ["user_id", "max_common_products_with_any_user"]
@@ -124,13 +116,15 @@ numeric_cols = [
     "num_other_users_shared_products",
     "max_common_products_with_any_user"
 ]
+
 for c in numeric_cols:
     if c in feature_df.columns:
         feature_df[c] = pd.to_numeric(feature_df[c], errors="coerce").fillna(0)
 
 feature_df.to_csv("neo4j_graph_features.csv", index=False)
+
 print("Saved neo4j_graph_features.csv")
-print("neo4j rows =", len(feature_df))
+print("Rows:", len(feature_df))
 print(feature_df.head())
 
 driver.close()
