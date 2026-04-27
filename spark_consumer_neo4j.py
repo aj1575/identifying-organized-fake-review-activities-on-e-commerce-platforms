@@ -17,7 +17,9 @@ from pyspark.sql.functions import (
     split,
     size,
     monotonically_increasing_id,
-    desc
+    desc,
+    concat_ws,
+    max as spark_max
 )
 from pyspark.sql.types import StructType, StringType, DoubleType, IntegerType
 from pyspark.ml.feature import NGram, HashingTF, MinHashLSH
@@ -36,22 +38,18 @@ class DGIM:
 
     def add_bit(self, bit):
         self.current_time += 1
-
         if bit == 1:
             self.buckets.insert(0, (1, self.current_time))
             self._compress_buckets()
 
     def _compress_buckets(self):
         changed = True
-
         while changed:
             changed = False
             size_to_indices = {}
 
-            for idx, (size, end_time) in enumerate(self.buckets):
-                if size not in size_to_indices:
-                    size_to_indices[size] = []
-                size_to_indices[size].append(idx)
+            for idx, (bucket_size, end_time) in enumerate(self.buckets):
+                size_to_indices.setdefault(bucket_size, []).append(idx)
 
             for bucket_size, indices in size_to_indices.items():
                 if len(indices) > 2:
@@ -74,11 +72,11 @@ class DGIM:
         threshold_time = self.current_time - k
         total = 0
 
-        for size, end_time in self.buckets:
+        for bucket_size, end_time in self.buckets:
             if end_time > threshold_time:
-                total += size
+                total += bucket_size
             else:
-                total += size // 2
+                total += bucket_size // 2
                 break
 
         return total
@@ -127,7 +125,7 @@ user_bloom = BloomFilter(size=10000, num_hashes=3)
 
 DGIM_K = 100
 DGIM_BURST_THRESHOLD = 30
-USER_BURST_THRESHOLD = 2
+USER_BURST_THRESHOLD = 3
 
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_USER = "neo4j"
@@ -149,40 +147,47 @@ spark = (
     .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1")
     .getOrCreate()
 )
+
 spark.sparkContext.setLogLevel("WARN")
 
 
 # =========================================================
 # 5. READ STREAM FROM KAFKA
 # =========================================================
-df = spark.readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "reviews_topic") \
-    .option("startingOffsets", "latest") \
+df = (
+    spark.readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", "localhost:9092")
+    .option("subscribe", "reviews_topic")
+    .option("startingOffsets", "latest")
     .load()
+)
 
 
 # =========================================================
 # 6. DEFINE SCHEMA
 # =========================================================
-schema = StructType() \
-    .add("review_id", StringType()) \
-    .add("user_id", StringType()) \
-    .add("product_id", StringType()) \
-    .add("rating", DoubleType()) \
-    .add("review_text", StringType()) \
-    .add("timestamp", StringType()) \
-    .add("label", StringType()) \
+schema = (
+    StructType()
+    .add("review_id", StringType())
+    .add("user_id", StringType())
+    .add("product_id", StringType())
+    .add("rating", DoubleType())
+    .add("review_text", StringType())
+    .add("timestamp", StringType())
+    .add("label", StringType())
     .add("source", StringType())
+)
 
 
 # =========================================================
 # 7. PARSE JSON
 # =========================================================
-parsed_df = df.selectExpr("CAST(value AS STRING) AS json_string") \
-    .select(from_json(col("json_string"), schema).alias("data")) \
-    .select("data.*")
+parsed_df = (
+    df.selectExpr("CAST(value AS STRING) AS json_string")
+      .select(from_json(col("json_string"), schema).alias("data"))
+      .select("data.*")
+)
 
 
 # =========================================================
@@ -212,7 +217,7 @@ anonymized_df = clean_df.withColumn(
 # =========================================================
 # 10. MAIN TABLE LOGIC
 # =========================================================
-low_rating_df = anonymized_df.filter(col("rating") <= 2)
+low_rating_df = anonymized_df.filter(col("rating") <= 3)
 
 user_windowed_stats_df = low_rating_df.groupBy(
     window(col("event_time"), "1 hour"),
@@ -221,7 +226,8 @@ user_windowed_stats_df = low_rating_df.groupBy(
 ).agg(
     count("*").alias("low_rating_reviews_by_user_5m"),
     approx_count_distinct("product_id").alias("distinct_products"),
-    collect_set("product_id").alias("product_ids")
+    collect_set("product_id").alias("product_ids"),
+    spark_max(when(col("source") == "synthetic_spam", 1).otherwise(0)).alias("source_spam_label")
 )
 
 final_df = user_windowed_stats_df.select(
@@ -231,7 +237,13 @@ final_df = user_windowed_stats_df.select(
     col("anonymous_user_id"),
     col("low_rating_reviews_by_user_5m"),
     col("distinct_products"),
-    col("product_ids")
+    col("product_ids"),
+    col("source_spam_label")
+)
+
+final_df = final_df.withColumn(
+    "num_products_in_window",
+    size(col("product_ids"))
 )
 
 final_df = final_df.withColumn(
@@ -241,7 +253,10 @@ final_df = final_df.withColumn(
 
 final_df = final_df.withColumn(
     "suspicious_user_flag",
-    when(col("burst_detected") == 1, 1).otherwise(0)
+    when(
+        (col("burst_detected") == 1) | (col("distinct_products") >= 3),
+        1
+    ).otherwise(0)
 )
 
 
@@ -304,9 +319,11 @@ def process_bloom_filter(batch_df, batch_id):
         print(f"Batch {batch_id} is empty")
         return
 
-    suspicious_rows = batch_df.filter(col("burst_detected") == 1) \
-                              .select("user_id") \
-                              .collect()
+    suspicious_rows = (
+        batch_df.filter(col("suspicious_user_flag") == 1)
+                .select("user_id")
+                .collect()
+    )
 
     for row in suspicious_rows:
         user_id = row["user_id"]
@@ -321,7 +338,7 @@ def process_bloom_filter(batch_df, batch_id):
     check_user_udf = udf(check_user, IntegerType())
 
     bloom_result_df = batch_df.withColumn(
-        "suspicious_user_flag",
+        "bloom_seen_before",
         check_user_udf(col("user_id"))
     )
 
@@ -357,38 +374,17 @@ def process_lsh(batch_df, batch_id):
         col("review_text").isNotNull() & (trim(col("review_text")) != "")
     )
 
-    valid_rows = lsh_input_df.count()
-    print(f"Rows with valid review_text: {valid_rows}")
-
-    if valid_rows == 0:
-        print("No valid review_text available for LSH in this batch.")
-        return
-
-    lsh_input_df = lsh_input_df.filter(col("rating") <= 2)
-
-    low_rating_text_rows = lsh_input_df.count()
-    print(f"Low-rating rows with text used for LSH: {low_rating_text_rows}")
-
-    if low_rating_text_rows < 2:
-        print("Not enough low-rating review_text rows for LSH comparison.")
+    if lsh_input_df.count() < 2:
+        print("Not enough review_text rows for LSH.")
         return
 
     text_df = lsh_input_df.withColumn(
         "clean_review_text",
-        trim(
-            regexp_replace(
-                lower(col("review_text")),
-                r"[^a-z0-9\s]",
-                ""
-            )
-        )
+        trim(regexp_replace(lower(col("review_text")), r"[^a-z0-9\s]", ""))
     ).filter(col("clean_review_text") != "")
 
-    cleaned_rows = text_df.count()
-    print(f"Rows after text cleaning: {cleaned_rows}")
-
-    if cleaned_rows < 2:
-        print("Not enough cleaned rows for LSH comparison.")
+    if text_df.count() < 2:
+        print("Not enough cleaned rows for LSH.")
         return
 
     text_df = text_df.withColumn("row_id", monotonically_increasing_id())
@@ -398,20 +394,14 @@ def process_lsh(batch_df, batch_id):
         split(col("clean_review_text"), r"\s+")
     ).filter(size(col("tokens")) >= 3)
 
-    token_rows = tokens_df.count()
-    print(f"Rows with at least 3 tokens: {token_rows}")
-
-    if token_rows < 2:
-        print("Not enough tokenized rows for shingling.")
+    if tokens_df.count() < 2:
+        print("Not enough tokenized rows for LSH.")
         return
 
     ngram = NGram(n=3, inputCol="tokens", outputCol="shingles")
     shingles_df = ngram.transform(tokens_df).filter(size(col("shingles")) > 0)
 
-    shingle_rows = shingles_df.count()
-    print(f"Rows with shingles: {shingle_rows}")
-
-    if shingle_rows < 2:
+    if shingles_df.count() < 2:
         print("Not enough shingled rows for LSH.")
         return
 
@@ -426,23 +416,18 @@ def process_lsh(batch_df, batch_id):
     mh = MinHashLSH(inputCol="features", outputCol="hashes", numHashTables=3)
     model = mh.fit(featured_df)
 
-    similar_pairs_df = model.approxSimilarityJoin(
-        featured_df,
-        featured_df,
-        0.4,
-        distCol="jaccard_distance"
-    ).filter(
-        col("datasetA.row_id") < col("datasetB.row_id")
-    ).select(
-        col("datasetA.user_id").alias("user_id_left"),
-        col("datasetA.product_id").alias("product_id_left"),
-        col("datasetA.clean_review_text").alias("review_text_left"),
-        col("datasetB.user_id").alias("user_id_right"),
-        col("datasetB.product_id").alias("product_id_right"),
-        col("datasetB.clean_review_text").alias("review_text_right"),
-        col("jaccard_distance"),
-        (1 - col("jaccard_distance")).alias("similarity_score")
-    ).orderBy(desc("similarity_score"))
+    similar_pairs_df = (
+        model.approxSimilarityJoin(featured_df, featured_df, 0.3, distCol="jaccard_distance")
+             .filter(col("datasetA.row_id") < col("datasetB.row_id"))
+             .select(
+                 col("datasetA.user_id").alias("user_id_left"),
+                 col("datasetA.product_id").alias("product_id_left"),
+                 col("datasetB.user_id").alias("user_id_right"),
+                 col("datasetB.product_id").alias("product_id_right"),
+                 (1 - col("jaccard_distance")).alias("similarity_score")
+             )
+             .orderBy(desc("similarity_score"))
+    )
 
     match_count = similar_pairs_df.count()
     print(f"Near-duplicate pairs found by LSH: {match_count}")
@@ -451,20 +436,7 @@ def process_lsh(batch_df, batch_id):
         print("No near-duplicate review pairs found in this batch.")
         return
 
-    print("-" * 70)
-    print(f"Batch: {batch_id}")
-    print("-" * 70)
-
-    similar_pairs_df.select(
-        "user_id_left",
-        "product_id_left",
-        "user_id_right",
-        "product_id_right",
-        "jaccard_distance",
-        "similarity_score"
-    ).show(20, truncate=False)
-
-    print(f"Finished LSH batch: {batch_id}")
+    similar_pairs_df.show(20, truncate=False)
 
 
 # =========================================================
@@ -501,8 +473,10 @@ def write_finaldf_to_neo4j(batch_df, batch_id):
     SET w.anonymous_user_id = row.anonymous_user_id,
         w.low_rating_reviews_by_user_5m = row.low_rating_reviews_by_user_5m,
         w.distinct_products = row.distinct_products,
+        w.num_products_in_window = row.num_products_in_window,
         w.burst_detected = row.burst_detected,
-        w.suspicious_user_flag = row.suspicious_user_flag
+        w.suspicious_user_flag = row.suspicious_user_flag,
+        w.source_spam_label = row.source_spam_label
 
     MERGE (u)-[:ACTIVE_IN_WINDOW]->(w)
 
@@ -519,8 +493,10 @@ def write_finaldf_to_neo4j(batch_df, batch_id):
         "window_end",
         "low_rating_reviews_by_user_5m",
         "distinct_products",
+        "num_products_in_window",
         "burst_detected",
         "suspicious_user_flag",
+        "source_spam_label",
         "product_ids"
     ).toLocalIterator()
 
@@ -536,8 +512,10 @@ def write_finaldf_to_neo4j(batch_df, batch_id):
                 "window_end": str(row["window_end"]),
                 "low_rating_reviews_by_user_5m": int(row["low_rating_reviews_by_user_5m"]),
                 "distinct_products": int(row["distinct_products"]),
+                "num_products_in_window": int(row["num_products_in_window"]),
                 "burst_detected": int(row["burst_detected"]),
                 "suspicious_user_flag": int(row["suspicious_user_flag"]),
+                "source_spam_label": int(row["source_spam_label"]),
                 "product_ids": row["product_ids"] if row["product_ids"] is not None else []
             })
 
@@ -556,11 +534,9 @@ def write_finaldf_to_neo4j(batch_df, batch_id):
 
 
 # =========================================================
-# 14.5 SAVE SPARK FEATURES BATCH FUNCTION
+# 15. SAVE SPARK FEATURES BATCH FUNCTION
 # =========================================================
 def save_spark_features_batch(batch_df, batch_id):
-    from pyspark.sql.functions import concat_ws, size
-
     print("\n" + "=" * 70)
     print(f"BATCH {batch_id}: SAVING SPARK FEATURES FOR ML")
     print("=" * 70)
@@ -574,13 +550,10 @@ def save_spark_features_batch(batch_df, batch_id):
 
     output_path = f"spark_features_output/batch_{batch_id}"
 
-    save_df = batch_df.withColumn(
-        "num_products_in_window",
-        size(col("product_ids"))
-    ).withColumn(
-        "product_ids_str",
-        concat_ws(",", col("product_ids"))
-    ).drop("product_ids")
+    save_df = (
+        batch_df.withColumn("product_ids_str", concat_ws(",", col("product_ids")))
+                .drop("product_ids")
+    )
 
     save_df.write \
         .mode("overwrite") \
@@ -591,68 +564,56 @@ def save_spark_features_batch(batch_df, batch_id):
 
 
 # =========================================================
-# 15. QUERY 1: MAIN TABLE
+# 16. STREAM QUERIES
 # =========================================================
-query1 = final_df.writeStream \
-    .format("console") \
-    .outputMode("complete") \
-    .option("truncate", "false") \
-    .option("numRows", 20) \
-    .queryName("user_level_table_v2") \
+query1 = (
+    final_df.writeStream
+    .format("console")
+    .outputMode("complete")
+    .option("truncate", "false")
+    .option("numRows", 20)
+    .queryName("user_level_table_v2")
     .start()
+)
 
-
-# =========================================================
-# 16. QUERY 2: DGIM OUTPUT
-# =========================================================
-query2 = clean_df.writeStream \
-    .foreachBatch(process_dgim) \
-    .outputMode("append") \
-    .queryName("dgim_output_v2") \
+query2 = (
+    clean_df.writeStream
+    .foreachBatch(process_dgim)
+    .outputMode("append")
+    .queryName("dgim_output_v2")
     .start()
+)
 
-
-# =========================================================
-# 17. QUERY 3: BLOOM FILTER OUTPUT
-# =========================================================
-query3 = final_df.writeStream \
-    .foreachBatch(process_bloom_filter) \
-    .outputMode("complete") \
-    .queryName("bloom_filter_output_v2") \
+query3 = (
+    final_df.writeStream
+    .foreachBatch(process_bloom_filter)
+    .outputMode("complete")
+    .queryName("bloom_filter_output_v2")
     .start()
+)
 
-
-# =========================================================
-# 18. QUERY 4: LSH OUTPUT
-# =========================================================
-query4 = clean_df.writeStream \
-    .foreachBatch(process_lsh) \
-    .outputMode("append") \
-    .queryName("lsh_output_v2") \
+query4 = (
+    clean_df.writeStream
+    .foreachBatch(process_lsh)
+    .outputMode("append")
+    .queryName("lsh_output_v2")
     .start()
+)
 
-
-# =========================================================
-# 19. QUERY 5: NEO4J OUTPUT
-# =========================================================
-query5 = final_df.writeStream \
-    .foreachBatch(write_finaldf_to_neo4j) \
-    .outputMode("complete") \
-    .queryName("neo4j_output_v2") \
+query5 = (
+    final_df.writeStream
+    .foreachBatch(write_finaldf_to_neo4j)
+    .outputMode("complete")
+    .queryName("neo4j_output_v2")
     .start()
+)
 
-
-# =========================================================
-# 20. QUERY 6: SAVE SPARK FEATURES (FOR ML)
-# =========================================================
-query6 = final_df.writeStream \
-    .foreachBatch(save_spark_features_batch) \
-    .outputMode("complete") \
-    .queryName("save_spark_features_v2") \
+query6 = (
+    final_df.writeStream
+    .foreachBatch(save_spark_features_batch)
+    .outputMode("complete")
+    .queryName("save_spark_features_v2")
     .start()
+)
 
-
-# =========================================================
-# 21. KEEP STREAMS RUNNING
-# =========================================================
 spark.streams.awaitAnyTermination()
